@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My WebServer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 15px;
+            padding: 40px;
+            backdrop-filter: blur(10px);
+        }
+        h1 {
+            text-align: center;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            font-size: 1.2em;
+            opacity: 0.9;
+            margin-bottom: 30px;
+        }
+        .info-box {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        .info-box h2 {
+            margin-top: 0;
+            font-size: 1.3em;
+        }
+        ul {
+            line-height: 1.8;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            opacity: 0.8;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>My WebServer</h1>
+        <p class="subtitle">Day1 - 最简 Web 服务器</p>
+
+        <div class="info-box">
+            <h2>服务器信息</h2>
+            <ul>
+                <li>语言：C++</li>
+                <li>I/O 模型：select 多路复用</li>
+                <li>协议：HTTP/1.0</li>
+                <li>端口：8080</li>
+            </ul>
+        </div>
+
+        <div class="info-box">
+            <h2>已实现功能</h2>
+            <ul>
+                <li>TCP Socket 通信</li>
+                <li>HTTP 请求解析</li>
+                <li>静态文件服务</li>
+                <li>404 错误处理</li>
+            </ul>
+        </div>
+
+        <div class="info-box">
+            <h2>待实现功能</h2>
+            <ul>
+                <li>Day2: HTTP 协议解析（GET/POST）</li>
+                <li>Day3: 线程池（并发处理）</li>
+                <li>Day4: 日志系统</li>
+                <li>Day5: 定时器</li>
+                <li>Day6: 数据库连接池</li>
+                <li>Day7: 整合 + 压测</li>
+            </ul>
+        </div>
+
+        <p class="footer">
+            恭喜！你的 Web 服务器已经运行起来了！
+        </p>
+    </div>
+</body>
+</html>
