@@ -10,6 +10,8 @@
 // HTTP 连接处理类 (Day2)
 // 功能：使用状态机解析 HTTP 请求
 // 状态机：按顺序解析 请求行 → 请求头 → 请求体
+//状态机就是：按顺。序处理每个部分，
+//每处理完一部分就进入下一个状态
 // ============================================================
 
 class HttpConn {
@@ -139,6 +141,7 @@ public:
         m_request.version = version;
 
         // 解析查询参数（GET 请求）
+        // GET 请求：/index.html?name=John&age=30
         size_t pos = path.find('?');
         if (pos != std::string::npos) {
             m_request.path = path.substr(0, pos);
@@ -236,7 +239,7 @@ public:
         response << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
                  << "Content-Type: " << content_type << "\r\n"
                  << "Content-Length: " << body.size() << "\r\n"
-                 << "Connection: close\r\n"
+                 << "Connection: close\r\n"// 关闭连接
                  << "\r\n"
                  << body;
 
@@ -254,8 +257,8 @@ public:
     }
 
 private:
-    ParseState m_state;     // 当前解析状态
-    Request m_request;      // 解析结果
+    ParseState m_state;     // 当前解析的请求状态
+    Request m_request;      // 请求的解析结果
     std::string m_query_string; // 查询参数
 };
 

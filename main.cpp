@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include "locker.h"
+#include "http_conn.h"
 
 // ============================================================
 // 最简 Web 服务器 (Day1)
@@ -125,7 +126,7 @@ int main() {
 }
 
 // ============================================================
-// 处理客户端请求
+// 处理客户端请求（使用 HttpConn 类）
 // 读取 HTTP 请求，解析请求行，返回对应的资源
 // ============================================================
 void handle_client(int client_fd) {
@@ -139,52 +140,77 @@ void handle_client(int client_fd) {
         return;
     }
 
-    // 打印收到的请求（调试用）
+    // 打印收求到的请（调试用）
     std::cout << "[请求内容]\n" << buffer << std::endl;
 
     // ========================================================
-    // 解析 HTTP 请求
-    // HTTP 请求格式：
-    //   GET /index.html HTTP/1.1
-    //   Host: localhost:8080
-    //   ...
+    // 使用 HttpConn 类解析 HTTP 请求
     // ========================================================
-    std::string request(buffer);
-    std::istringstream request_stream(request);
-    std::string method, path, version;
-
-    // 读取请求行：方法 路径 版本
-    request_stream >> method >> path >> version;
-
-    std::cout << "[解析] 方法=" << method << " 路径=" << path << std::endl;
-
-    // 只处理 GET 请求
-    if (method != "GET") {
-        std::string response = build_response(405, "text/plain", "Method Not Allowed");
+    HttpConn http_conn;
+    if (!http_conn.parse(buffer, bytes_read)) {
+        std::string response = http_conn.build_response(400, "text/plain", "Bad Request");
         send(client_fd, response.c_str(), response.size(), 0);
         close(client_fd);
         return;
     }
 
-    // 默认路径为 index.html
-    if (path == "/") {
-        path = "/index.html";
+    // 获取解析结果
+    HttpConn::Method method = http_conn.get_method();
+    std::string path = http_conn.get_path();
+
+    std::cout << "[解析] 方法=" << (method == HttpConn::GET ? "GET" : "POST")
+              << " 路径=" << path << std::endl;
+
+    // ========================================================
+    // 处理 GET 请求
+    // ========================================================
+    if (method == HttpConn::GET) {
+        // 默认路径为 index.html
+        if (path == "/") {
+            path = "/index.html";
+        }
+
+        // 拼接文件路径（相对于 root 目录）
+        std::string file_path = "root" + path;
+
+        // 读取文件内容
+        std::string content = read_file(file_path);
+
+        if (content.empty()) {
+            // 文件不存在，返回 404
+            std::string response = http_conn.build_response(404, "text/html",
+                "<html><body><h1>404 Not Found</h1><p>页面不存在</p></body></html>");
+            send(client_fd, response.c_str(), response.size(), 0);
+        } else {
+            // 文件存在，返回 200
+            std::string response = http_conn.build_response(200, "text/html", content);
+            send(client_fd, response.c_str(), response.size(), 0);
+        }
     }
+    // ========================================================
+    // 处理 POST 请求
+    // ========================================================
+    else if (method == HttpConn::POST) {
+        // 处理 POST 请求
+        std::string body = http_conn.get_body();
+        std::string response;
 
-    // 拼接文件路径（相对于 root 目录）
-    std::string file_path = "root" + path;
+        // 简单的 POST 处理示例
+        if (path == "/api/submit") {
+            // 返回接收到的数据
+            response = http_conn.build_response(200, "text/plain",
+                "收到 POST 数据：\n" + body);
+        } else {
+            response = http_conn.build_response(404, "text/plain", "API 不存在");
+        }
 
-    // 读取文件内容
-    std::string content = read_file(file_path);
-
-    if (content.empty()) {
-        // 文件不存在，返回 404
-        std::string response = build_response(404, "text/html",
-            "<html><body><h1>404 Not Found</h1><p>页面不存在</p></body></html>");
         send(client_fd, response.c_str(), response.size(), 0);
-    } else {
-        // 文件存在，返回 200
-        std::string response = build_response(200, "text/html", content);
+    }
+    // ========================================================
+    // 其他方法
+    // ========================================================
+    else {
+        std::string response = http_conn.build_response(405, "text/plain", "Method Not Allowed");
         send(client_fd, response.c_str(), response.size(), 0);
     }
 
@@ -207,31 +233,3 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
-// ============================================================
-// 构建 HTTP 响应
-// HTTP 响应格式：
-//   HTTP/1.1 200 OK\r\n
-//   Content-Type: text/html\r\n
-//   Content-Length: 1234\r\n
-//   \r\n
-//   <html>...</html>
-// ============================================================
-std::string build_response(int status_code, const std::string& content_type, const std::string& body) {
-    std::string status_text;
-    switch (status_code) {
-        case 200: status_text = "OK"; break;
-        case 404: status_text = "Not Found"; break;
-        case 405: status_text = "Method Not Allowed"; break;
-        default: status_text = "Unknown"; break;
-    }
-
-    std::ostringstream response;
-    response << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
-             << "Content-Type: " << content_type << "\r\n"
-             << "Content-Length: " << body.size() << "\r\n"
-             << "Connection: close\r\n"
-             << "\r\n"
-             << body;
-
-    return response.str();
-}
