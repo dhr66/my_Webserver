@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include "locker.h"
 #include "http_conn.h"
+#include "threadpool.h"
 
 // ============================================================
 // 最简 Web 服务器 (Day1)
@@ -26,7 +27,6 @@ const int BUFFER_SIZE = 4096;    // 读写缓冲区大小
 // 函数声明
 void handle_client(int client_fd);
 std::string read_file(const std::string& path);
-std::string build_response(int status_code, const std::string& content_type, const std::string& body);
 
 int main() {
     // ========================================================
@@ -76,6 +76,19 @@ int main() {
     std::cout << "========================================" << std::endl;
 
     // ========================================================
+    // 创建线程池（8 个工作线程）
+    // ========================================================
+    ThreadPool* pool = nullptr;
+    try {
+        pool = new ThreadPool(8);
+        std::cout << "[线程池] 已创建 8 个工作线程" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "[错误] 线程池创建失败: " << e.what() << std::endl;
+        close(listen_fd);
+        return 1;
+    }
+
+    // ========================================================
     // 第四步：使用 select 实现 I/O 多路复用
     // select 可以同时监听多个文件描述符
     // 当任何一个有数据可读时，select 返回
@@ -116,11 +129,22 @@ int main() {
                       << inet_ntoa(client_addr.sin_addr) << ":"
                       << ntohs(client_addr.sin_port) << std::endl;
 
-            // 处理客户端请求
-            handle_client(client_fd);
+            // 使用线程池处理客户端请求（异步）
+            // 创建任务：捕获 client_fd，调用 handle_client
+            std::function<void()> task = [client_fd]() {
+                handle_client(client_fd);
+            };
+
+            // 添加任务到线程池
+            if (!pool->append(task)) {
+                std::cerr << "[错误] 线程池任务队列已满，拒绝连接" << std::endl;
+                close(client_fd);
+            }
         }
     }
 
+    // 清理线程池
+    delete pool;
     close(listen_fd);
     return 0;
 }
@@ -140,7 +164,7 @@ void handle_client(int client_fd) {
         return;
     }
 
-    // 打印收求到的请（调试用）
+    // 打印收到的请求（调试用）
     std::cout << "[请求内容]\n" << buffer << std::endl;
 
     // ========================================================
