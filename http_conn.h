@@ -41,6 +41,7 @@ public:
         std::map<std::string, std::string> headers; // 请求头
         std::string body;                           // 请求体
         int content_length;                         // Content-Length
+        bool keep_alive;                            // 是否长连接
     };
 
     // HTTP 响应结构
@@ -54,6 +55,7 @@ public:
 public:
     HttpConn() : m_state(REQUEST_LINE), m_request{} {
         m_request.content_length = 0;
+        m_request.keep_alive = false;  // 默认短连接
     }
 
     ~HttpConn() {}
@@ -184,6 +186,15 @@ public:
             m_request.content_length = std::stoi(value);
         }
 
+        // 检查 Connection 头
+        if (key == "Connection") {
+            // 去除前导空格
+            while (!value.empty() && value[0] == ' ') {
+                value = value.substr(1);
+            }
+            m_request.keep_alive = (value == "keep-alive");
+        }
+
         return true;
     }
 
@@ -218,6 +229,10 @@ public:
         return m_query_string;
     }
 
+    bool is_keep_alive() const {
+        return m_request.keep_alive;
+    }
+
     bool is_finished() const {
         return m_state == FINISH;
     }
@@ -225,7 +240,8 @@ public:
     // ============================================================
     // 构建 HTTP 响应
     // ============================================================
-    std::string build_response(int status_code, const std::string& content_type, const std::string& body) {
+    std::string build_response(int status_code, const std::string& content_type,
+                               const std::string& body, bool keep_alive = false) {
         std::string status_text;
         switch (status_code) {
             case 200: status_text = "OK"; break;
@@ -239,7 +255,7 @@ public:
         response << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
                  << "Content-Type: " << content_type << "\r\n"
                  << "Content-Length: " << body.size() << "\r\n"
-                 << "Connection: close\r\n"// 关闭连接
+                 << "Connection: " << (keep_alive ? "keep-alive" : "close") << "\r\n"
                  << "\r\n"
                  << body;
 

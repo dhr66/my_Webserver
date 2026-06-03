@@ -28,6 +28,9 @@ const int BUFFER_SIZE = 4096;    // 读写缓冲区大小
 // epoll 文件描述符（全局变量，方便清理）
 int g_epfd = -1;
 
+// 线程池指针（全局变量，方便事件处理函数访问）
+ThreadPool* g_pool = nullptr;
+
 // 函数声明
 void handle_client(int client_fd);
 std::string read_file(const std::string& path);
@@ -43,6 +46,56 @@ int setnonblocking(int fd) {
     int new_option = old_option | O_NONBLOCK;  // 加上非阻塞标志
     fcntl(fd, F_SETFL, new_option);            // 设置新的标志位
     return old_option;                         // 返回旧的标志位（备用）
+}
+
+// ============================================================
+// Reactor 模式的核心：事件处理函数
+// 主线程只负责"通知"，工作线程负责"干活"
+// ============================================================
+
+// 处理新连接事件（主线程执行）
+void on_new_connection(int listen_fd) {
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+
+    // accept 接受连接
+    int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+    if (client_fd < 0) {
+        perror("accept 失败");
+        return;
+    }
+
+    std::cout << "[新连接] 客户端: "
+              << inet_ntoa(client_addr.sin_addr) << ":"
+              << ntohs(client_addr.sin_port) << std::endl;
+
+    // 设置非阻塞模式
+    setnonblocking(client_fd);
+
+    // 注册到 epoll，使用 ET 模式
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    event.data.fd = client_fd;
+
+    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client_fd, &event) < 0) {
+        perror("epoll_ctl 添加客户端失败");
+        close(client_fd);
+    }
+}
+
+// 处理数据到达事件（工作线程执行）
+void on_data_arrival(int client_fd) {
+    // 使用线程池处理
+    std::function<void()> task = [client_fd]() {
+        // handle_client 内部会循环处理多个请求（长连接）
+        handle_client(client_fd);
+    };
+
+    if (!g_pool->append(task)) {
+        std::cerr << "[错误] 线程池任务队列已满" << std::endl;
+        epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
+        close(client_fd);
+    }
 }
 
 int main() {
@@ -95,9 +148,8 @@ int main() {
     // ========================================================
     // 创建线程池（8 个工作线程）
     // ========================================================
-    ThreadPool* pool = nullptr;
     try {
-        pool = new ThreadPool(8);
+        g_pool = new ThreadPool(8);
         std::cout << "[线程池] 已创建 8 个工作线程" << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "[错误] 线程池创建失败: " << e.what() << std::endl;
@@ -113,7 +165,7 @@ int main() {
     g_epfd = epoll_create(1);
     if (g_epfd < 0) {
         perror("epoll_create 失败");
-        delete pool;
+        delete g_pool;
         close(listen_fd);
         return 1;
     }
@@ -132,16 +184,15 @@ int main() {
     if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_fd, &event) < 0) {
         perror("epoll_ctl 失败");
         close(g_epfd);
-        delete pool;
+        delete g_pool;
         close(listen_fd);
         return 1;
     }
     std::cout << "[epoll] 监听 socket 已注册" << std::endl;
 
     // ========================================================
-    // 第六步：事件循环（epoll_wait 替代 select）
-    // epoll_wait 阻塞等待事件发生
-    // 返回值是就绪的文件描述符数量
+    // 第六步：Reactor 事件循环
+    // 主线程只负责事件分发，不处理业务逻辑
     // ========================================================
     struct epoll_event events[MAX_EVENTS];  // 存储就绪事件的数组
 
@@ -154,65 +205,26 @@ int main() {
         }
 
         // ====================================================
-        // 第七步：遍历就绪的文件描述符
-        // 注意：这里只遍历就绪的 fd，不是全部 fd！
+        // 第七步：事件分发
+        // 主线程只负责"通知"，具体处理交给工作线程
         // ====================================================
         for (int i = 0; i < ready; i++) {
             int sockfd = events[i].data.fd;
 
-            // 情况 1：监听 socket 可读，说明有新连接
+            // 事件类型 1：新连接到达
             if (sockfd == listen_fd) {
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-
-                // accept 接受连接，返回一个新的 socket 用于通信
-                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-                if (client_fd < 0) {
-                    perror("accept 失败");
-                    continue;
-                }
-
-                std::cout << "[新连接] 客户端: "
-                          << inet_ntoa(client_addr.sin_addr) << ":"
-                          << ntohs(client_addr.sin_port) << std::endl;
-
-                // 设置客户端 socket 为非阻塞模式
-                // 为什么？ET 模式只通知一次，必须用非阻塞 IO 循环读完
-                setnonblocking(client_fd);
-
-                // 把新连接注册到 epoll，使用 ET 模式（边缘触发）
-                // EPOLLET：只通知一次，性能更高
-                struct epoll_event client_event;
-                client_event.events = EPOLLIN | EPOLLET;  // ET 模式
-                client_event.data.fd = client_fd;
-
-                if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client_fd, &client_event) < 0) {
-                    perror("epoll_ctl 添加客户端失败");
-                    close(client_fd);
-                    continue;
-                }
+                on_new_connection(listen_fd);
             }
-            // 情况 2：客户端 socket 可读，说明有数据到达
+            // 事件类型 2：数据到达
             else {
-                // 使用线程池处理客户端请求（异步）
-                std::function<void()> task = [sockfd]() {
-                    handle_client(sockfd);
-                };
-
-                // 添加任务到线程池
-                if (!pool->append(task)) {
-                    std::cerr << "[错误] 线程池任务队列已满，拒绝连接" << std::endl;
-                    // 从 epoll 中移除并关闭连接
-                    epoll_ctl(g_epfd, EPOLL_CTL_DEL, sockfd, nullptr);
-                    close(sockfd);
-                }
+                on_data_arrival(sockfd);
             }
         }
     }
 
     // 清理资源
     close(g_epfd);
-    delete pool;
+    delete g_pool;
     close(listen_fd);
     return 0;
 }
@@ -278,6 +290,7 @@ void handle_client(int client_fd) {
     if (!http_conn.parse(buffer, total_read)) {
         std::string response = http_conn.build_response(400, "text/plain", "Bad Request");
         send(client_fd, response.c_str(), response.size(), 0);
+        epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
         close(client_fd);
         return;
     }
@@ -292,6 +305,8 @@ void handle_client(int client_fd) {
     // ========================================================
     // 处理 GET 请求
     // ========================================================
+    bool keep_alive = http_conn.is_keep_alive();
+
     if (method == HttpConn::GET) {
         // 默认路径为 index.html
         if (path == "/") {
@@ -307,11 +322,13 @@ void handle_client(int client_fd) {
         if (content.empty()) {
             // 文件不存在，返回 404
             std::string response = http_conn.build_response(404, "text/html",
-                "<html><body><h1>404 Not Found</h1><p>页面不存在</p></body></html>");
+                "<html><body><h1>404 Not Found</h1><p>页面不存在</p></body></html>",
+                keep_alive);
             send(client_fd, response.c_str(), response.size(), 0);
         } else {
             // 文件存在，返回 200
-            std::string response = http_conn.build_response(200, "text/html", content);
+            std::string response = http_conn.build_response(200, "text/html",
+                content, keep_alive);
             send(client_fd, response.c_str(), response.size(), 0);
         }
     }
@@ -327,9 +344,10 @@ void handle_client(int client_fd) {
         if (path == "/api/submit") {
             // 返回接收到的数据
             response = http_conn.build_response(200, "text/plain",
-                "收到 POST 数据：\n" + body);
+                "收到 POST 数据：\n" + body, keep_alive);
         } else {
-            response = http_conn.build_response(404, "text/plain", "API 不存在");
+            response = http_conn.build_response(404, "text/plain",
+                "API 不存在", keep_alive);
         }
 
         send(client_fd, response.c_str(), response.size(), 0);
@@ -338,15 +356,24 @@ void handle_client(int client_fd) {
     // 其他方法
     // ========================================================
     else {
-        std::string response = http_conn.build_response(405, "text/plain", "Method Not Allowed");
+        std::string response = http_conn.build_response(405, "text/plain",
+            "Method Not Allowed", keep_alive);
         send(client_fd, response.c_str(), response.size(), 0);
     }
 
-    // 关闭连接（HTTP/1.0 短连接）
-    // 注意：关闭前要从 epoll 中移除，否则 epoll 会监控一个无效的 fd
-    epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
-    close(client_fd);
-    std::cout << "[完成] 响应已发送" << std::endl;
+    // ========================================================
+    // 长连接处理
+    // 如果是 keep-alive，不关闭连接，等 epoll 下次通知
+    // 如果是 close，关闭连接
+    // ========================================================
+    if (keep_alive) {
+        std::cout << "[长连接] 保持连接，等待下一次请求" << std::endl;
+    } else {
+        // 关闭连接（HTTP/1.0 短连接）
+        epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
+        close(client_fd);
+        std::cout << "[短连接] 响应已发送，连接关闭" << std::endl;
+    }
 }
 
 // ============================================================
