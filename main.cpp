@@ -5,28 +5,45 @@
 #include <cstring>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <sys/epoll.h>    // epoll 头文件
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <cerrno>         // errno
 #include "locker.h"
 #include "http_conn.h"
 #include "threadpool.h"
 
 // ============================================================
-// 最简 Web 服务器 (Day1)
+// Web 服务器 (Day4 - epoll 版本)
 // 功能：接收 HTTP 请求，返回静态网页
-// 核心流程：socket → bind → listen → select → accept → 收发数据
+// 核心流程：socket → bind → listen → epoll → accept → 收发数据
 // ============================================================
 
 // 服务器配置
 const int PORT = 8080;           // 监听端口
-const int MAX_EVENTS = 1024;     // select 最大监听数
+const int MAX_EVENTS = 1024;     // epoll 最大监听数
 const int BUFFER_SIZE = 4096;    // 读写缓冲区大小
+
+// epoll 文件描述符（全局变量，方便清理）
+int g_epfd = -1;
 
 // 函数声明
 void handle_client(int client_fd);
 std::string read_file(const std::string& path);
+
+// ============================================================
+// 设置文件描述符为非阻塞模式
+// 为什么需要非阻塞？
+//   ET 模式只通知一次，必须一次读完，如果用阻塞 IO，读到没数据时会卡住
+//   非阻塞 IO 读到没数据时返回 EAGAIN，不会卡住
+// ============================================================
+int setnonblocking(int fd) {
+    int old_option = fcntl(fd, F_GETFL);      // 获取旧的标志位
+    int new_option = old_option | O_NONBLOCK;  // 加上非阻塞标志
+    fcntl(fd, F_SETFL, new_option);            // 设置新的标志位
+    return old_option;                         // 返回旧的标志位（备用）
+}
 
 int main() {
     // ========================================================
@@ -89,61 +106,112 @@ int main() {
     }
 
     // ========================================================
-    // 第四步：使用 select 实现 I/O 多路复用
-    // select 可以同时监听多个文件描述符
-    // 当任何一个有数据可读时，select 返回
+    // 第四步：创建 epoll 实例
+    // epoll_create 创建一个 epoll 实例，返回文件描述符
+    // 参数 1 只是给内核一个提示，现在已废弃，填大于 0 的数就行
     // ========================================================
-    fd_set read_fds;        // 可读文件描述符集合
-    int max_fd = listen_fd; // 当前最大的文件描述符
+    g_epfd = epoll_create(1);
+    if (g_epfd < 0) {
+        perror("epoll_create 失败");
+        delete pool;
+        close(listen_fd);
+        return 1;
+    }
+    std::cout << "[epoll] 创建成功，epfd = " << g_epfd << std::endl;
+
+    // ========================================================
+    // 第五步：把监听 socket 注册到 epoll
+    // epoll_ctl 用于添加/修改/删除要监控的文件描述符
+    // EPOLLIN 表示关心"可读"事件（有新连接到来）
+    // 监听 socket 用 LT（水平触发），确保所有连接都能 accept
+    // ========================================================
+    struct epoll_event event;
+    event.events = EPOLLIN;        // LT 模式（不用 EPOLLET）
+    event.data.fd = listen_fd;     // 哪个文件描述符
+
+    if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, listen_fd, &event) < 0) {
+        perror("epoll_ctl 失败");
+        close(g_epfd);
+        delete pool;
+        close(listen_fd);
+        return 1;
+    }
+    std::cout << "[epoll] 监听 socket 已注册" << std::endl;
+
+    // ========================================================
+    // 第六步：事件循环（epoll_wait 替代 select）
+    // epoll_wait 阻塞等待事件发生
+    // 返回值是就绪的文件描述符数量
+    // ========================================================
+    struct epoll_event events[MAX_EVENTS];  // 存储就绪事件的数组
 
     while (true) {
-        // 每次循环都要重新设置，因为 select 会修改这个集合
-        FD_ZERO(&read_fds);            // 清空集合
-        FD_SET(listen_fd, &read_fds);  // 把监听 socket 加入集合
-
-        // 等待任意一个文件描述符可读（阻塞）
-        // 最后一个参数 nullptr 表示无限等待
-        int ready = select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr);
+        // 阻塞等待事件，-1 表示无限等待
+        int ready = epoll_wait(g_epfd, events, MAX_EVENTS, -1);
         if (ready < 0) {
-            perror("select 失败");
+            perror("epoll_wait 失败");
             break;
         }
 
         // ====================================================
-        // 第五步：检查哪些文件描述符就绪
+        // 第七步：遍历就绪的文件描述符
+        // 注意：这里只遍历就绪的 fd，不是全部 fd！
         // ====================================================
+        for (int i = 0; i < ready; i++) {
+            int sockfd = events[i].data.fd;
 
-        // 如果监听 socket 可读，说明有新连接到来
-        if (FD_ISSET(listen_fd, &read_fds)) {
-            struct sockaddr_in client_addr;
-            socklen_t client_len = sizeof(client_addr);
+            // 情况 1：监听 socket 可读，说明有新连接
+            if (sockfd == listen_fd) {
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
 
-            // accept 接受连接，返回一个新的 socket 用于通信
-            int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
-            if (client_fd < 0) {
-                perror("accept 失败");
-                continue;
+                // accept 接受连接，返回一个新的 socket 用于通信
+                int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    perror("accept 失败");
+                    continue;
+                }
+
+                std::cout << "[新连接] 客户端: "
+                          << inet_ntoa(client_addr.sin_addr) << ":"
+                          << ntohs(client_addr.sin_port) << std::endl;
+
+                // 设置客户端 socket 为非阻塞模式
+                // 为什么？ET 模式只通知一次，必须用非阻塞 IO 循环读完
+                setnonblocking(client_fd);
+
+                // 把新连接注册到 epoll，使用 ET 模式（边缘触发）
+                // EPOLLET：只通知一次，性能更高
+                struct epoll_event client_event;
+                client_event.events = EPOLLIN | EPOLLET;  // ET 模式
+                client_event.data.fd = client_fd;
+
+                if (epoll_ctl(g_epfd, EPOLL_CTL_ADD, client_fd, &client_event) < 0) {
+                    perror("epoll_ctl 添加客户端失败");
+                    close(client_fd);
+                    continue;
+                }
             }
+            // 情况 2：客户端 socket 可读，说明有数据到达
+            else {
+                // 使用线程池处理客户端请求（异步）
+                std::function<void()> task = [sockfd]() {
+                    handle_client(sockfd);
+                };
 
-            std::cout << "[新连接] 客户端: "
-                      << inet_ntoa(client_addr.sin_addr) << ":"
-                      << ntohs(client_addr.sin_port) << std::endl;
-
-            // 使用线程池处理客户端请求（异步）
-            // 创建任务：捕获 client_fd，调用 handle_client
-            std::function<void()> task = [client_fd]() {
-                handle_client(client_fd);
-            };
-
-            // 添加任务到线程池
-            if (!pool->append(task)) {
-                std::cerr << "[错误] 线程池任务队列已满，拒绝连接" << std::endl;
-                close(client_fd);
+                // 添加任务到线程池
+                if (!pool->append(task)) {
+                    std::cerr << "[错误] 线程池任务队列已满，拒绝连接" << std::endl;
+                    // 从 epoll 中移除并关闭连接
+                    epoll_ctl(g_epfd, EPOLL_CTL_DEL, sockfd, nullptr);
+                    close(sockfd);
+                }
             }
         }
     }
 
-    // 清理线程池
+    // 清理资源
+    close(g_epfd);
     delete pool;
     close(listen_fd);
     return 0;
@@ -152,15 +220,51 @@ int main() {
 // ============================================================
 // 处理客户端请求（使用 HttpConn 类）
 // 读取 HTTP 请求，解析请求行，返回对应的资源
+//
+// ET 模式下必须循环读取，直到返回 EAGAIN
+// 为什么？ET 只通知一次，如果没读完，不会再通知你了
 // ============================================================
 void handle_client(int client_fd) {
     char buffer[BUFFER_SIZE];
     memset(buffer, 0, sizeof(buffer));
 
-    // 读取客户端发送的数据
-    int bytes_read = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_read <= 0) {
-        close(client_fd);
+    // ET 模式：循环读取，直到返回 EAGAIN（数据读完了）
+    int total_read = 0;
+    while (true) {
+        int bytes_read = recv(client_fd, buffer + total_read,
+                              sizeof(buffer) - total_read - 1, 0);
+
+        if (bytes_read < 0) {
+            // EAGAIN 表示数据读完了（非阻塞 IO 的正常情况）
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;  // 读完了，退出循环
+            }
+            // 其他错误
+            perror("recv 失败");
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
+            close(client_fd);
+            return;
+        }
+
+        if (bytes_read == 0) {
+            // 对端关闭连接
+            std::cout << "[连接关闭] 客户端断开" << std::endl;
+            epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
+            close(client_fd);
+            return;
+        }
+
+        // 成功读到数据
+        total_read += bytes_read;
+
+        // 防止缓冲区溢出
+        if (total_read >= sizeof(buffer) - 1) {
+            break;
+        }
+    }
+
+    // 没读到数据
+    if (total_read <= 0) {
         return;
     }
 
@@ -171,7 +275,7 @@ void handle_client(int client_fd) {
     // 使用 HttpConn 类解析 HTTP 请求
     // ========================================================
     HttpConn http_conn;
-    if (!http_conn.parse(buffer, bytes_read)) {
+    if (!http_conn.parse(buffer, total_read)) {
         std::string response = http_conn.build_response(400, "text/plain", "Bad Request");
         send(client_fd, response.c_str(), response.size(), 0);
         close(client_fd);
@@ -239,6 +343,8 @@ void handle_client(int client_fd) {
     }
 
     // 关闭连接（HTTP/1.0 短连接）
+    // 注意：关闭前要从 epoll 中移除，否则 epoll 会监控一个无效的 fd
+    epoll_ctl(g_epfd, EPOLL_CTL_DEL, client_fd, nullptr);
     close(client_fd);
     std::cout << "[完成] 响应已发送" << std::endl;
 }

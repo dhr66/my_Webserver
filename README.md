@@ -157,6 +157,8 @@ if (listen_fd < 0) {
 
 #### 3.3.2 绑定地址
 
+![image-20260603155907862](C:\Users\LENOVO\AppData\Roaming\Typora\typora-user-images\image-20260603155907862.png)
+
 ```cpp
 struct sockaddr_in server_addr;
 memset(&server_addr, 0, sizeof(server_addr));
@@ -172,6 +174,7 @@ if (bind(listen_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
 ```
 
 **字节序转换：**
+
 - `htonl()`：host to network long（32 位）
 - `htons()`：host to network short（16 位）
 - `ntohl()`：network to host long
@@ -197,7 +200,7 @@ int max_fd = listen_fd; // 当前最大的文件描述符
 
 while (true) {
     // 每次循环都要重新设置
-    FD_ZERO(&read_fds);            // 清空集合
+    FD_ZERO(&read_fds);            // 清空集合 
     FD_SET(listen_fd, &read_fds);  // 把监听 socket 加入集合
 
     // 等待任意一个文件描述符可读（阻塞）
@@ -207,7 +210,7 @@ while (true) {
         break;
     }
 
-    // 检查监听 socket 是否可读
+    // 检查监听 socket 是否可读，这里使用的是短链接，每次接受完新连接，通信一次就关闭
     if (FD_ISSET(listen_fd, &read_fds)) {
         // 接受新连接
         int client_fd = accept(listen_fd, ...);
@@ -235,7 +238,7 @@ while (true) {
 
 #### 3.4.2 阻塞 vs 非阻塞
 
-- **阻塞**：函数调用后，线程挂起，直到条件满足
+- **阻塞**：函数调用后，线程挂起，直到条件满足，下处理机
 - **非阻塞**：函数调用后，立即返回，需要轮询检查
 
 #### 3.4.3 I/O 多路复用
